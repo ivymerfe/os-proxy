@@ -5,7 +5,7 @@ source colors.sh
 export PROXY_HOST="localhost"
 export PROXY_PORT="8080"
 
-export URL="http://xcal1.vodafone.co.uk/10MB.zip"
+export URL="http://localhost:9000/10MB.zip"
 export REQUESTS="10"
 
 CONCURRENCY=10

@@ -3,7 +3,7 @@
 
 # Show colors only if connected to terminal
 if [ -t 1 ]; then
-	ESeq="\e["
+	ESeq=$'\033['
 	RCol="$ESeq"'0m' # Text Reset
 	Bold="$ESeq"'1m';
 	Dim="$ESeq"'2m';

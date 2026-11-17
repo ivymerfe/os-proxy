@@ -32,7 +32,7 @@ void CacheEntry::closeReader(const EntryReader& reader) noexcept {
     if (readers_.erase(&reader) == 0) {
       return;
     }
-    if (readers_.empty() && state_ == State::Loading) {
+    if (readers_.empty() && state_ == State::Loading && !cacheable_.load()) {
       cancelled_ = true;
     }
     cv_.notify_all();
@@ -93,9 +93,12 @@ bool CacheEntry::append(const char* data, std::size_t size) {
   std::unique_lock lock(mutex_);
   if (!cacheable_.load()) {
     cv_.wait(lock, [&] {
-      return cancelled_ ||
+      return cancelled_ || readers_.empty() ||
              base_ + body_.size() - minPositionLocked() < kWindowBytes;
     });
+    if (readers_.empty()) {
+      cancelled_ = true;
+    }
   }
   if (cancelled_) {
     return false;
