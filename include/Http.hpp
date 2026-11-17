@@ -10,6 +10,8 @@
 
 #include "Net.hpp"
 
+constexpr std::size_t kMaxRequestBody = 16 * 1024 * 1024;
+
 struct Header {
   std::string name;
   std::string value;
@@ -49,18 +51,20 @@ class HttpResponses {
   static std::string error(int status, std::string_view message);
 };
 
-class RequestReader {
- public:
-  static constexpr std::size_t kMaxHeaderBytes = 16 * 1024;
+class RequestParser {
+public:
+    static constexpr std::size_t kMaxHeaderBytes = 16 * 1024;
 
-  RequestReader(Socket& socket, std::chrono::milliseconds timeout)
-      : socket_(socket), timeout_(timeout) {}
+    explicit RequestParser(int socketId) : socketId_(socketId) {}
 
-  std::optional<HttpRequest> read();
+    bool feed(const char* data, std::size_t size);
+    HttpRequest take();
 
- private:
-  Socket& socket_;
-  std::chrono::milliseconds timeout_;
+private:
+    int socketId_;
+    std::string buffer_;
+    std::size_t previous_{0};
+    std::optional<HttpRequest> request_;
 };
 
 using BodySource = std::function<bool(std::string&)>;

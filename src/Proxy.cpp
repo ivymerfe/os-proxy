@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <limits>
 #include <new>
 #include <system_error>
@@ -21,6 +22,7 @@ void runFetch(Cache& cache,
               const StopSignal& stop,
               const Config& config,
               const HttpRequest& request,
+              const BodySource& body,
               const std::shared_ptr<CacheEntry>& entry) {
   int status = 500;
   int socketId = -1;
@@ -38,7 +40,7 @@ void runFetch(Cache& cache,
     }
     UpstreamClient client(stop, config.upstreamTimeout);
     client.exchange(
-        request, {},
+        request, body,
         [&](const ResponseHead& head) {
           const bool tooLarge =
               head.contentLength && *head.contentLength > cache.maxEntrySize();
@@ -89,184 +91,525 @@ void runFetch(Cache& cache,
 
 }  // namespace
 
-ClientSession::ClientSession(Socket socket,
-                             Cache& cache,
-                             ThreadPool& fetchPool,
-                             const StopSignal& stop,
-                             const Config& config)
+Session::Session(Socket socket,
+                 Cache& cache,
+                 ThreadPool& fetchPool,
+                 const StopSignal& stop,
+                 const Config& config,
+                 std::function<void()> notify)
     : socket_(std::move(socket)),
+      parser_(socket_.id()),
       cache_(cache),
       fetchPool_(fetchPool),
       stop_(stop),
-      config_(config) {}
+      config_(config),
+      notify_(std::move(notify)),
+      deadline_(Clock::now() + config.clientTimeout) {}
 
-void ClientSession::run() {
+short Session::events() const noexcept {
+  switch (state_) {
+    case State::Streaming:
+      return outPos_ < out_.size() ? POLLOUT : POLLIN;
+    case State::Flushing:
+      return POLLOUT;
+    case State::Done:
+      return 0;
+    default:
+      return POLLIN;
+  }
+}
+
+void Session::touch() {
+  deadline_ = Clock::now() + config_.clientTimeout;
+}
+
+void Session::finish() noexcept {
+  state_ = State::Done;
+  reader_.reset();
+}
+
+void Session::send(std::string data) {
+  out_ = std::move(data);
+  outPos_ = 0;
+  touch();
+}
+
+void Session::fail(int status, std::string_view message) {
+  reader_.reset();
+  if (headSent_) {
+    socket_.abort();
+    state_ = State::Done;
+    return;
+  }
+  try {
+    send(HttpResponses::error(status, message));
+    state_ = State::Flushing;
+  } catch (...) {
+    state_ = State::Done;
+  }
+}
+
+void Session::report() {
   Logger& log = Logger::instance();
   const int id = socket_.id();
   try {
-    handle();
-    return;
+    throw;
   } catch (const HttpError& e) {
     log.write(levelFor(e.status()), e.what(),
               e.socketId() >= 0 ? e.socketId() : id, url_);
-    respond(e.status(), e.what());
-  } catch (const IoTimeout& e) {
-    log.write(LogLevel::Warn, std::string("client timeout: ") + e.what(), id,
-              url_);
-    respond(408, "client timed out");
-  } catch (const IoStopped&) {
-    log.write(LogLevel::Notice, "connection closed: proxy is shutting down", id,
-              url_);
+    fail(e.status(), e.what());
   } catch (const IoFailure& e) {
     log.write(LogLevel::Warn, std::string("I/O failure: ") + e.what(), id,
               url_);
+    finish();
   } catch (const std::bad_alloc&) {
     log.write(LogLevel::Error, "out of memory", id, url_);
-    respond(500, "out of memory");
+    fail(500, "out of memory");
   } catch (const std::system_error& e) {
     log.write(LogLevel::Error, std::string("system error: ") + e.what(), id,
               url_);
-    respond(500, "internal server error");
+    fail(500, "internal server error");
   } catch (const std::exception& e) {
     log.write(LogLevel::Error, std::string("internal error: ") + e.what(), id,
               url_);
-    respond(500, "internal server error");
+    fail(500, "internal server error");
   } catch (...) {
     log.write(LogLevel::Error, "unknown internal error", id, url_);
-    respond(500, "internal server error");
+    fail(500, "internal server error");
   }
 }
 
-void ClientSession::respond(int status, std::string_view message) {
-  if (headSent_) {
-    socket_.abort();
+void Session::advance() {
+  for (int attempt = 0; attempt < 2 && state_ != State::Done; ++attempt) {
+    try {
+      while (state_ != State::Done && step()) {
+      }
+      return;
+    } catch (...) {
+      report();
+    }
+  }
+}
+
+void Session::onTimeout() {
+  Logger::instance().write(LogLevel::Warn, "client timed out", socket_.id(),
+                           url_);
+  if (state_ == State::ReadingRequest || state_ == State::ReadingBody) {
+    fail(408, "client timed out");
     return;
   }
-  sendError(status, message);
+  socket_.abort();
+  finish();
 }
 
-void ClientSession::reject(int status, std::string_view message) {
-  sendError(status, message);
+bool Session::step() {
+  switch (state_) {
+    case State::ReadingRequest:
+      return readRequest();
+    case State::ReadingBody:
+      return readBody();
+    case State::WaitingHead:
+      return waitHead();
+    case State::Streaming:
+      return stream();
+    case State::Flushing:
+      return flush();
+    case State::Done:
+      return false;
+  }
+  return false;
 }
 
-void ClientSession::sendError(int status, std::string_view message) {
-  try {
-    socket_.writeAll(HttpResponses::error(status, message),
-                     std::chrono::seconds(5));
-  } catch (const std::exception& e) {
-    Logger::instance().write(
-        LogLevel::Warn,
-        std::string("failed to deliver error response: ") + e.what(),
-        socket_.id(), url_);
+bool Session::readRequest() {
+  char chunk[4096];
+  for (;;) {
+    const IoResult result = socket_.tryRead(chunk, sizeof chunk);
+    if (result.status == IoStatus::WouldBlock) {
+      return false;
+    }
+    if (result.status == IoStatus::Closed) {
+      if (!received_) {
+        Logger::instance().print(
+            LogLevel::Debug,
+            "client closed connection without request, socket=", socket_.id());
+        finish();
+        return false;
+      }
+      throw HttpError(400, "connection closed before the request was complete",
+                      socket_.id());
+    }
+    received_ = true;
+    touch();
+    if (!parser_.feed(chunk, result.bytes)) {
+      continue;
+    }
+    request_ = parser_.take();
+    url_ = request_->url;
+    Logger::instance().print(LogLevel::Log, request_->method, " ", url_,
+                             " socket=", socket_.id());
+    if (request_->contentLength.value_or(0) > kMaxRequestBody) {
+      throw HttpError(413, "request body is too large", socket_.id());
+    }
+    if (request_->method == "GET") {
+      startGet();
+    } else {
+      body_ = std::move(request_->bodyPrefix);
+      state_ = State::ReadingBody;
+    }
+    return true;
   }
 }
 
-void ClientSession::handle() {
-  RequestReader reader(socket_, config_.clientTimeout);
-  const auto request = reader.read();
-  if (!request) {
-    Logger::instance().print(
-        LogLevel::Debug,
-        "client closed connection without request, socket=", socket_.id());
-    return;
+bool Session::readBody() {
+  const std::size_t total = request_->contentLength.value_or(0);
+  char chunk[16384];
+  while (body_.size() < total) {
+    const IoResult result =
+        socket_.tryRead(chunk, std::min(sizeof chunk, total - body_.size()));
+    if (result.status == IoStatus::WouldBlock) {
+      return false;
+    }
+    if (result.status == IoStatus::Closed) {
+      throw HttpError(
+          400,
+          "client closed the connection before the request body was complete",
+          socket_.id());
+    }
+    body_.append(chunk, result.bytes);
+    touch();
   }
-  url_ = request->url;
-  Logger::instance().print(LogLevel::Log, request->method, " ", request->url,
-                           " socket=", socket_.id());
-  if (request->method == "GET") {
-    serveCached(*request);
-  } else {
-    serveDirect(*request);
-  }
+  startDirect();
+  return true;
 }
 
-void ClientSession::startFetch(const HttpRequest& request,
-                               const std::shared_ptr<CacheEntry>& entry) {
-  auto copy = std::make_shared<const HttpRequest>(request);
+void Session::startFetch(BodySource body,
+                         const std::shared_ptr<CacheEntry>& entry) {
+  auto copy = std::make_shared<const HttpRequest>(*request_);
+  auto source = std::make_shared<BodySource>(std::move(body));
   Cache* cache = &cache_;
   const StopSignal* stop = &stop_;
   const Config* config = &config_;
   const bool scheduled =
-      fetchPool_.trySubmit([cache, stop, config, entry, copy] {
-        runFetch(*cache, *stop, *config, *copy, entry);
+      fetchPool_.trySubmit([cache, stop, config, entry, copy, source] {
+        runFetch(*cache, *stop, *config, *copy, *source, entry);
       });
   if (!scheduled) {
     Logger::instance().write(LogLevel::Error,
                              "failed to schedule upstream fetch", socket_.id(),
-                             request.url);
+                             url_);
     entry->fail(500, "failed to schedule upstream fetch");
     cache_.remove(entry);
   }
 }
 
-void ClientSession::serveCached(const HttpRequest& request) {
-  auto acquired = cache_.acquire(request.url);
+void Session::startGet() {
+  auto acquired = cache_.acquire(url_);
+  reader_ = std::move(acquired.reader);
+  reader_->setNotifier(notify_);
   if (acquired.created) {
-    Logger::instance().print(LogLevel::Debug, "cache miss: ", request.url);
-    startFetch(request, acquired.entry);
+    Logger::instance().print(LogLevel::Debug, "cache miss: ", url_);
+    startFetch({}, acquired.entry);
   } else {
-    Logger::instance().print(LogLevel::Debug, "cache hit: ", request.url);
+    Logger::instance().print(LogLevel::Debug, "cache hit: ", url_);
   }
+  state_ = State::WaitingHead;
+  deadline_ = Clock::time_point::max();
+}
 
-  const std::string head = acquired.reader->waitHead();
-  headSent_ = true;
-  socket_.writeAll(head, config_.clientTimeout);
+void Session::startDirect() {
+  auto acquired = cache_.acquireTransient(url_);
+  reader_ = std::move(acquired.reader);
+  reader_->setNotifier(notify_);
+  auto body = std::make_shared<std::string>(std::move(body_));
+  BodySource source;
+  if (!body->empty()) {
+    source = [body, finished = false](std::string& out) mutable {
+      if (finished) {
+        return false;
+      }
+      finished = true;
+      out = std::move(*body);
+      return true;
+    };
+  }
+  startFetch(std::move(source), acquired.entry);
+  state_ = State::WaitingHead;
+  deadline_ = Clock::time_point::max();
+}
 
-  std::string chunk;
+void Session::checkPeer() {
+  char scratch[512];
   for (;;) {
-    switch (acquired.reader->next(chunk, 64 * 1024)) {
+    const IoResult result = socket_.tryRead(scratch, sizeof scratch);
+    if (result.status == IoStatus::Ok) {
+      continue;
+    }
+    if (result.status == IoStatus::Closed) {
+      Logger::instance().write(LogLevel::Debug, "client disconnected",
+                               socket_.id(), url_);
+      finish();
+    }
+    return;
+  }
+}
+
+bool Session::waitHead() {
+  std::string head;
+  if (reader_->tryHead(head) == CacheEntry::HeadStatus::Pending) {
+    checkPeer();
+    return false;
+  }
+  send(std::move(head));
+  headSent_ = true;
+  state_ = State::Streaming;
+  return true;
+}
+
+bool Session::stream() {
+  for (;;) {
+    while (outPos_ < out_.size()) {
+      const IoResult result =
+          socket_.tryWrite(out_.data() + outPos_, out_.size() - outPos_);
+      if (result.status == IoStatus::WouldBlock) {
+        return false;
+      }
+      outPos_ += result.bytes;
+      touch();
+    }
+    switch (reader_->tryNext(out_, 64 * 1024)) {
       case CacheEntry::ReadStatus::Data:
-        socket_.writeAll(chunk, config_.clientTimeout);
+        outPos_ = 0;
         break;
+      case CacheEntry::ReadStatus::Pending:
+        deadline_ = Clock::time_point::max();
+        checkPeer();
+        return false;
       case CacheEntry::ReadStatus::End:
-        return;
+        finish();
+        return false;
       case CacheEntry::ReadStatus::Failed:
-        throw HttpError(502, acquired.reader->failureMessage(), socket_.id());
+        throw HttpError(502, reader_->failureMessage(), socket_.id());
     }
   }
 }
 
-void ClientSession::serveDirect(const HttpRequest& request) {
-  UpstreamClient client(stop_, config_.upstreamTimeout);
-  std::string prefix = request.bodyPrefix;
-  std::size_t remaining = request.contentLength.value_or(0);
-
-  BodySource body;
-  if (remaining > 0) {
-    body = [&](std::string& out) -> bool {
-      if (remaining == 0) {
-        return false;
-      }
-      if (!prefix.empty()) {
-        out = std::move(prefix);
-        prefix.clear();
-        remaining -= out.size();
-        return true;
-      }
-      char buffer[16384];
-      const std::size_t n = socket_.readSome(
-          buffer, std::min(sizeof buffer, remaining), config_.clientTimeout);
-      if (n == 0) {
-        throw IoFailure(
-            "client closed the connection before the request body was complete",
-            0);
-      }
-      out.assign(buffer, n);
-      remaining -= n;
-      return true;
-    };
+bool Session::flush() {
+  while (outPos_ < out_.size()) {
+    const IoResult result =
+        socket_.tryWrite(out_.data() + outPos_, out_.size() - outPos_);
+    if (result.status == IoStatus::WouldBlock) {
+      return false;
+    }
+    outPos_ += result.bytes;
+    touch();
   }
+  finish();
+  return false;
+}
 
-  client.exchange(
-      request, body,
-      [&](const ResponseHead& head) {
-        const std::string text = head.serializeForClient();
-        headSent_ = true;
-        socket_.writeAll(text, config_.clientTimeout);
-      },
-      [&](const char* data, std::size_t size) {
-        socket_.writeAll(std::string_view(data, size), config_.clientTimeout);
-      });
+Reactor::Reactor(Cache& cache,
+                 ThreadPool& fetchPool,
+                 const StopSignal& stop,
+                 const Config& config)
+    : cache_(cache), fetchPool_(fetchPool), stop_(stop), config_(config) {
+  int fds[2];
+  if (::pipe(fds) < 0) {
+    throw std::system_error(errno, std::generic_category(), "pipe");
+  }
+  wakeRead_.reset(fds[0]);
+  wakeWrite_.reset(fds[1]);
+  if (!Platform::setNonBlockCloexec(fds[0]) ||
+      !Platform::setNonBlockCloexec(fds[1])) {
+    throw std::system_error(errno, std::generic_category(), "fcntl");
+  }
+}
+
+Reactor::~Reactor() {
+  stop();
+}
+
+void Reactor::start() {
+  thread_ = std::thread([this] { loop(); });
+}
+
+void Reactor::stop() {
+  quit_.store(true);
+  signal();
+  if (thread_.joinable()) {
+    thread_.join();
+  }
+}
+
+void Reactor::signal() noexcept {
+  const char one = 1;
+  const ssize_t written = ::write(wakeWrite_.get(), &one, 1);
+  (void)written;
+}
+
+bool Reactor::adopt(UniqueFd& fd) {
+  {
+    std::lock_guard lock(mutex_);
+    if (!alive_.load()) {
+      return false;
+    }
+    try {
+      incoming_.push_back(std::move(fd));
+    } catch (...) {
+      return false;
+    }
+    load_.fetch_add(1);
+  }
+  signal();
+  return true;
+}
+
+void Reactor::wake(std::uint64_t id) noexcept {
+  try {
+    std::lock_guard lock(mutex_);
+    ready_.insert(id);
+  } catch (...) {
+  }
+  signal();
+}
+
+void Reactor::drainWakeups() {
+  char buffer[256];
+  for (;;) {
+    const ssize_t n = ::read(wakeRead_.get(), buffer, sizeof buffer);
+    if (n > 0) {
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    return;
+  }
+}
+
+void Reactor::adoptNow(UniqueFd&& fd) {
+  const std::uint64_t id = nextId_++;
+  try {
+    auto session = std::make_unique<Session>(Socket(std::move(fd), stop_),
+                                             cache_, fetchPool_, stop_, config_,
+                                             [this, id] { wake(id); });
+    Session* raw = session.get();
+    sessions_.emplace(id, std::move(session));
+    raw->advance();
+  } catch (const std::exception& e) {
+    Logger::instance().print(LogLevel::Error,
+                             "failed to start session: ", e.what());
+    sessions_.erase(id);
+    load_.fetch_sub(1);
+  }
+}
+
+void Reactor::loop() {
+  Logger& log = Logger::instance();
+  std::vector<pollfd> fds;
+  std::vector<std::uint64_t> ids;
+  while (!stop_.requested() && !quit_.load()) {
+    fds.clear();
+    ids.clear();
+    fds.push_back({wakeRead_.get(), POLLIN, 0});
+    fds.push_back({stop_.fd(), POLLIN, 0});
+    auto nearest = Session::Clock::time_point::max();
+    for (const auto& [id, session] : sessions_) {
+      fds.push_back({session->fd(), session->events(), 0});
+      ids.push_back(id);
+      nearest = std::min(nearest, session->deadline());
+    }
+    int timeout = -1;
+    if (nearest != Session::Clock::time_point::max()) {
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            nearest - Session::Clock::now()) +
+                        std::chrono::milliseconds(1);
+      timeout =
+          static_cast<int>(std::clamp<long long>(left.count(), 0, INT_MAX));
+    }
+    const int rc = ::poll(fds.data(), fds.size(), timeout);
+    if (rc < 0) {
+      const int e = errno;
+      if (e == EINTR) {
+        continue;
+      }
+      log.print(LogLevel::Error, describeErrno("poll", e),
+                " in reactor, stopping it");
+      break;
+    }
+    if ((fds[1].revents & POLLIN) != 0) {
+      break;
+    }
+    if ((fds[0].revents & POLLIN) != 0) {
+      drainWakeups();
+    }
+
+    std::deque<UniqueFd> fresh;
+    std::unordered_set<std::uint64_t> run;
+    {
+      std::lock_guard lock(mutex_);
+      fresh.swap(incoming_);
+      run.swap(ready_);
+    }
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      if (fds[i + 2].revents != 0) {
+        run.insert(ids[i]);
+      }
+    }
+    for (const std::uint64_t id : run) {
+      if (const auto it = sessions_.find(id); it != sessions_.end()) {
+        it->second->advance();
+      }
+    }
+    for (auto& fd : fresh) {
+      adoptNow(std::move(fd));
+    }
+    const auto now = Session::Clock::now();
+    for (auto& entry : sessions_) {
+      Session& session = *entry.second;
+      if (!session.done() && session.deadline() <= now) {
+        session.onTimeout();
+        session.advance();
+      }
+    }
+    for (auto it = sessions_.begin(); it != sessions_.end();) {
+      if (it->second->done()) {
+        it = sessions_.erase(it);
+        load_.fetch_sub(1);
+      } else {
+        ++it;
+      }
+    }
+  }
+  alive_.store(false);
+  sessions_.clear();
+  std::lock_guard lock(mutex_);
+  incoming_.clear();
+  load_.store(0);
+}
+
+void Server::reject(UniqueFd fd, int status, std::string_view message) {
+  try {
+    Socket socket(std::move(fd), stop_);
+    const std::string text = HttpResponses::error(status, message);
+    socket.tryWrite(text.data(), text.size());
+  } catch (const std::exception& e) {
+    Logger::instance().print(LogLevel::Debug,
+                             "failed to deliver rejection: ", e.what());
+  }
+}
+
+std::size_t Server::totalLoad() const {
+  std::size_t total = 0;
+  for (const auto& reactor : reactors_) {
+    total += reactor->load();
+  }
+  return total;
+}
+
+Reactor& Server::pickReactor() {
+  return **std::min_element(
+      reactors_.begin(), reactors_.end(),
+      [](const auto& a, const auto& b) { return a->load() < b->load(); });
 }
 
 UniqueFd Server::createListener() {
@@ -325,13 +668,7 @@ void Server::handleDescriptorExhaustion() {
   spare_.reset();
   const int fd = Platform::acceptConnection(listener_.get());
   if (fd >= 0) {
-    try {
-      Socket socket(UniqueFd(fd), stop_);
-      socket.writeAll(
-          HttpResponses::error(503, "server is out of file descriptors"),
-          std::chrono::seconds(1));
-    } catch (...) {
-    }
+    reject(UniqueFd(fd), 503, "server is out of file descriptors");
   }
   const int spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
   if (spare < 0) {
@@ -357,12 +694,18 @@ void Server::acceptOne() {
     return;
   }
 
-  auto session = std::make_shared<ClientSession>(
-      Socket(UniqueFd(fd), stop_), *cache_, *fetchPool_, stop_, config_);
-  if (!clientPool_->trySubmit([session] { session->run(); })) {
+  UniqueFd client(fd);
+  if (totalLoad() >= config_.maxSessions) {
     Logger::instance().write(
-        LogLevel::Warn, "client queue is full, rejecting connection", fd, "-");
-    session->reject(503, "server is overloaded, please try again later");
+        LogLevel::Warn, "session limit reached, rejecting connection", fd, "-");
+    reject(std::move(client), 503,
+           "server is overloaded, please try again later");
+    return;
+  }
+  if (!pickReactor().adopt(client)) {
+    Logger::instance().write(LogLevel::Error,
+                             "no reactor accepted the connection", fd, "-");
+    reject(std::move(client), 503, "server is unavailable");
   }
 }
 
@@ -397,10 +740,15 @@ int Server::run() {
     cache_ = std::make_unique<Cache>(config_.cacheInitialSize,
                                      config_.cacheMaxSize, config_.cacheTtl);
     fetchPool_ =
-        std::make_unique<ThreadPool>("fetch", config_.clientThreads,
+        std::make_unique<ThreadPool>("fetch", config_.clientThreads * 2,
                                      std::numeric_limits<std::size_t>::max());
-    clientPool_ = std::make_unique<ThreadPool>("client", config_.clientThreads,
-                                               config_.queueSize);
+    for (std::size_t i = 0; i < config_.clientThreads; ++i) {
+      reactors_.push_back(
+          std::make_unique<Reactor>(*cache_, *fetchPool_, stop_, config_));
+    }
+    for (auto& reactor : reactors_) {
+      reactor->start();
+    }
 
     const int spare = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (spare < 0) {
@@ -412,7 +760,7 @@ int Server::run() {
 
     log.print(LogLevel::Notice, "Proxy listening on port ", config_.port,
               ", client threads: ", config_.clientThreads,
-              ", queue: ", config_.queueSize,
+              ", max sessions: ", config_.maxSessions,
               ", cache: ", config_.cacheInitialSize, "..", config_.cacheMaxSize,
               " bytes, ttl: ", config_.cacheTtl.count(), "s");
 
@@ -421,7 +769,9 @@ int Server::run() {
     log.print(LogLevel::Notice, "Received shutdown signal");
     listener_.reset();
     log.print(LogLevel::Notice, "Stopped accepting new connections");
-    clientPool_->shutdown(false);
+    for (auto& reactor : reactors_) {
+      reactor->stop();
+    }
     log.print(LogLevel::Notice, "All connections closed");
     cache_->shutdown();
     fetchPool_->shutdown(true);

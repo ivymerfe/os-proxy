@@ -300,6 +300,8 @@ std::string_view HttpResponses::reason(int status) noexcept {
       return "Bad Request";
     case 408:
       return "Request Timeout";
+    case 413:
+      return "Payload Too Large";
     case 500:
       return "Internal Server Error";
     case 501:
@@ -328,48 +330,41 @@ std::string HttpResponses::error(int status, std::string_view message) {
   return out;
 }
 
-std::optional<HttpRequest> RequestReader::read() {
-  std::string buffer;
-  std::size_t previous = 0;
-  char chunk[4096];
-  for (;;) {
-    if (buffer.size() >= kMaxHeaderBytes) {
-      throw HttpError(400, "request headers exceed 16 KB", socket_.id());
+bool RequestParser::feed(const char* data, std::size_t size) {
+  buffer_.append(data, size);
+  const char* method = nullptr;
+  const char* path = nullptr;
+  std::size_t methodLen = 0;
+  std::size_t pathLen = 0;
+  std::size_t headerCount = kMaxHeaders;
+  int minor = 0;
+  phr_header raw[kMaxHeaders];
+  const int parsed =
+      phr_parse_request(buffer_.data(), buffer_.size(), &method, &methodLen,
+                        &path, &pathLen, &minor, raw, &headerCount, previous_);
+  if (parsed > 0) {
+    if (static_cast<std::size_t>(parsed) > kMaxHeaderBytes) {
+      throw HttpError(400, "request headers exceed 16 KB", socketId_);
     }
-    const std::size_t want =
-        std::min(sizeof chunk, kMaxHeaderBytes - buffer.size());
-    const std::size_t got = socket_.readSome(chunk, want, timeout_);
-    if (got == 0) {
-      if (buffer.empty()) {
-        return std::nullopt;
-      }
-      throw HttpError(400, "connection closed before the request was complete",
-                      socket_.id());
-    }
-    buffer.append(chunk, got);
-
-    const char* method = nullptr;
-    const char* path = nullptr;
-    std::size_t methodLen = 0;
-    std::size_t pathLen = 0;
-    std::size_t headerCount = kMaxHeaders;
-    int minor = 0;
-    phr_header raw[kMaxHeaders];
-    const int parsed =
-        phr_parse_request(buffer.data(), buffer.size(), &method, &methodLen,
-                          &path, &pathLen, &minor, raw, &headerCount, previous);
-    if (parsed > 0) {
-      return buildRequest(
-          std::string_view(method, methodLen), std::string_view(path, pathLen),
-          minor, raw, headerCount,
-          std::string_view(buffer).substr(static_cast<std::size_t>(parsed)),
-          socket_.id());
-    }
-    if (parsed == -1) {
-      throw HttpError(400, "malformed HTTP request", socket_.id());
-    }
-    previous = buffer.size();
+    request_ = buildRequest(
+        std::string_view(method, methodLen), std::string_view(path, pathLen),
+        minor, raw, headerCount,
+        std::string_view(buffer_).substr(static_cast<std::size_t>(parsed)),
+        socketId_);
+    return true;
   }
+  if (parsed == -1) {
+    throw HttpError(400, "malformed HTTP request", socketId_);
+  }
+  if (buffer_.size() >= kMaxHeaderBytes) {
+    throw HttpError(400, "request headers exceed 16 KB", socketId_);
+  }
+  previous_ = buffer_.size();
+  return false;
+}
+
+HttpRequest RequestParser::take() {
+  return std::move(*request_);
 }
 
 std::size_t UpstreamClient::receive(Socket& socket,

@@ -22,7 +22,7 @@ std::unique_ptr<EntryReader> CacheEntry::openReader() {
   if (cancelled_ || state_ == State::Failed || !cacheable_.load()) {
     return nullptr;
   }
-  readers_.emplace(reader.get(), 0);
+  readers_.emplace(reader.get(), ReaderState{});
   return reader;
 }
 
@@ -40,13 +40,28 @@ void CacheEntry::closeReader(const EntryReader& reader) noexcept {
   }
 }
 
-void CacheEntry::setHead(std::string head) {
-  {
-    std::lock_guard lock(mutex_);
-    head_ = std::move(head);
-    headReady_ = true;
+void CacheEntry::setNotifier(const EntryReader& reader,
+                             std::function<void()> notify) {
+  std::lock_guard lock(mutex_);
+  if (const auto it = readers_.find(&reader); it != readers_.end()) {
+    it->second.notify = std::move(notify);
   }
+}
+
+void CacheEntry::notifyLocked() {
   cv_.notify_all();
+  for (auto& item : readers_) {
+    if (item.second.notify) {
+      item.second.notify();
+    }
+  }
+}
+
+void CacheEntry::setHead(std::string head) {
+  std::lock_guard lock(mutex_);
+  head_ = std::move(head);
+  headReady_ = true;
+  notifyLocked();
 }
 
 bool CacheEntry::tryReserve(std::size_t bytes) {
@@ -69,7 +84,7 @@ void CacheEntry::markUncacheable() {
 std::size_t CacheEntry::minPositionLocked() const {
   std::size_t position = base_ + body_.size();
   for (const auto& item : readers_) {
-    position = std::min(position, item.second);
+    position = std::min(position, item.second.position);
   }
   return position;
 }
@@ -86,56 +101,52 @@ bool CacheEntry::append(const char* data, std::size_t size) {
     return false;
   }
   body_.append(data, size);
-  cv_.notify_all();
+  notifyLocked();
   return true;
 }
 
 void CacheEntry::complete() {
-  {
-    std::lock_guard lock(mutex_);
-    if (state_ != State::Loading) {
-      return;
-    }
-    state_ = State::Complete;
-    completedAt_ = Clock::now();
+  std::lock_guard lock(mutex_);
+  if (state_ != State::Loading) {
+    return;
   }
-  cv_.notify_all();
+  state_ = State::Complete;
+  completedAt_ = Clock::now();
+  notifyLocked();
 }
 
 void CacheEntry::fail(int status, std::string message) {
-  {
-    std::lock_guard lock(mutex_);
-    if (state_ != State::Loading) {
-      return;
-    }
-    state_ = State::Failed;
-    failStatus_ = status;
-    failMessage_ = std::move(message);
+  std::lock_guard lock(mutex_);
+  if (state_ != State::Loading) {
+    return;
   }
-  cv_.notify_all();
+  state_ = State::Failed;
+  failStatus_ = status;
+  failMessage_ = std::move(message);
+  notifyLocked();
 }
 
-std::string CacheEntry::waitHead() {
-  std::unique_lock lock(mutex_);
-  cv_.wait(lock, [&] { return headReady_ || state_ == State::Failed; });
-  if (!headReady_) {
+CacheEntry::HeadStatus CacheEntry::tryHead(std::string& out) {
+  std::lock_guard lock(mutex_);
+  if (headReady_) {
+    out = head_;
+    return HeadStatus::Ready;
+  }
+  if (state_ == State::Failed) {
     throw HttpError(failStatus_, failMessage_);
   }
-  return head_;
+  return HeadStatus::Pending;
 }
 
-CacheEntry::ReadStatus CacheEntry::read(const EntryReader& reader,
-                                        std::string& out,
-                                        std::size_t maxBytes) {
-  std::unique_lock lock(mutex_);
+CacheEntry::ReadStatus CacheEntry::tryNext(const EntryReader& reader,
+                                           std::string& out,
+                                           std::size_t maxBytes) {
+  std::lock_guard lock(mutex_);
   const auto it = readers_.find(&reader);
   if (it == readers_.end()) {
     return ReadStatus::Failed;
   }
-  std::size_t& position = it->second;
-  cv_.wait(lock, [&] {
-    return base_ + body_.size() > position || state_ != State::Loading;
-  });
+  std::size_t& position = it->second.position;
   const std::size_t total = base_ + body_.size();
   if (total > position) {
     const std::size_t n = std::min(maxBytes, total - position);
@@ -151,7 +162,10 @@ CacheEntry::ReadStatus CacheEntry::read(const EntryReader& reader,
     }
     return ReadStatus::Data;
   }
-  return state_ == State::Complete ? ReadStatus::End : ReadStatus::Failed;
+  if (state_ == State::Complete) {
+    return ReadStatus::End;
+  }
+  return state_ == State::Failed ? ReadStatus::Failed : ReadStatus::Pending;
 }
 
 std::string CacheEntry::failureMessage() const {
@@ -252,6 +266,13 @@ Cache::Acquired Cache::acquire(const std::string& key) {
     lru_.pop_front();
     throw;
   }
+  return {std::move(entry), std::move(reader), true};
+}
+
+Cache::Acquired Cache::acquireTransient(const std::string& key) {
+  auto entry = std::make_shared<CacheEntry>(key, *this);
+  auto reader = entry->openReader();
+  entry->markUncacheable();
   return {std::move(entry), std::move(reader), true};
 }
 

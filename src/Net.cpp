@@ -86,6 +86,43 @@ void Socket::writeAll(std::string_view data,
   }
 }
 
+IoResult Socket::tryRead(char* buffer, std::size_t size) {
+  for (;;) {
+    const ssize_t n = ::recv(fd_.get(), buffer, size, 0);
+    if (n > 0) {
+      return {IoStatus::Ok, static_cast<std::size_t>(n)};
+    }
+    if (n == 0) {
+      return {IoStatus::Closed, 0};
+    }
+    const int e = errno;
+    if (e == EINTR) {
+      continue;
+    }
+    if (e == EAGAIN || e == EWOULDBLOCK) {
+      return {IoStatus::WouldBlock, 0};
+    }
+    throw IoFailure(describeErrno("recv", e), e);
+  }
+}
+
+IoResult Socket::tryWrite(const char* data, std::size_t size) {
+  for (;;) {
+    const ssize_t n = ::send(fd_.get(), data, size, MSG_NOSIGNAL);
+    if (n >= 0) {
+      return {IoStatus::Ok, static_cast<std::size_t>(n)};
+    }
+    const int e = errno;
+    if (e == EINTR) {
+      continue;
+    }
+    if (e == EAGAIN || e == EWOULDBLOCK) {
+      return {IoStatus::WouldBlock, 0};
+    }
+    throw IoFailure(describeErrno("send", e), e);
+  }
+}
+
 void Socket::abort() noexcept {
   if (!fd_.valid()) {
     return;

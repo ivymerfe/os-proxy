@@ -12,10 +12,10 @@
 struct Config {
   std::uint16_t port{8080};
   std::size_t clientThreads{4};
+  std::size_t maxSessions{1024};
   std::size_t cacheInitialSize{1024 * 1024};
   std::size_t cacheMaxSize{10 * 1024 * 1024};
   std::chrono::seconds cacheTtl{5};
-  std::size_t queueSize{128};
   LogLevel logLevel{LogLevel::Log};
   std::chrono::milliseconds upstreamTimeout{10000};
   std::chrono::milliseconds clientTimeout{30000};

@@ -4,25 +4,19 @@
 flowchart TB
     C[Клиенты] --> A[Server: accept + poll]
     S((StopSignal pipe)) -. SIGINT/SIGTERM .-> A
-    A -->|trySubmit| Q[(Очередь backlog)]
-    A -->|очередь полна| R503[503 + close]
-    Q --> CP[Client ThreadPool]
-    CP --> CS[ClientSession]
-    CS --> RR[RequestReader + picohttpparser]
-    CS -->|GET| CA[Cache.acquire]
-    CA -->|hit / ожидание| ER[EntryReader]
+    A -->|наименее загруженный| R[Reactor x N: poll-цикл]
+    A -->|лимит сессий| R503[503 + close]
+    R --> SS[Session: конечный автомат]
+    SS --> P[RequestParser + picohttpparser]
+    SS -->|GET| CA[Cache.acquire]
+    SS -->|PUT/POST/DELETE| TR[Cache.acquireTransient]
     CA -->|miss| FP[Fetch ThreadPool]
-    FP --> RF[runFetch]
-    RF --> U[UpstreamClient]
-    U --> O[(Целевой сервер)]
+    TR --> FP
+    FP --> RF[runFetch] --> U[UpstreamClient] --> O[(Целевой сервер)]
     RF -->|head и данные| CE[CacheEntry]
-    CE -->|по мере поступления| ER
-    ER --> CS
-    CS -->|PUT/POST/DELETE| U
+    CE -->|notify: wake через pipe| R
+    SS -->|tryHead / tryNext| CE
     M[Cache maintenance thread] -->|рост ёмкости, TTL, LRU| CA
-    L[Logger] -.-> CS
-    L -.-> RF
-    L -.-> M
 ```
 
 ## Модули
@@ -40,9 +34,10 @@ flowchart TB
 
 ## Потоки
 
-- **main**: `poll(listen, stop-fd)`, принимает соединения и кладёт сессии в ограниченную очередь. При переполнении отвечает 503.
-- **Client pool** (`--max-client-threads`): читает запрос, отдаёт данные клиенту. Сессий может быть больше потоков за счёт очереди.
-- **Fetch pool**: загрузка с целевого сервера для GET. Одна запись кэша даёт один запрос на сервер.
+- **main**: `poll(listen, stop-fd)`, принимает соединения, выбирает reactor с минимальной нагрузкой. При превышении `--max-sessions` отвечает 503.
+- **Reactor** (`--max-client-threads` штук): один `poll` на все свои сессии, wake-pipe и stop-fd. Таймаут `poll` равен ближайшему дедлайну сессии, холостых циклов нет. Одна нить обслуживает любое число сессий.
+- **Session**: ReadingRequest, ReadingBody, WaitingHead, Streaming, Flushing, Done. Все операции неблокирующие, при `WouldBlock` сессия ждёт событие `poll`.
+- **Fetch pool** (`2 * max-client-threads`): блокирующая загрузка с целевого сервера. Новые данные в записи кэша будят reactor сессии через callback.
 - **Cache maintenance**: спит на condition variable (таймер TTL/2, не реже раза в секунду, или запрос на память) и выполняет рост ёмкости, чистку просроченных записей и LRU-вытеснение.
 
 ## Кэш

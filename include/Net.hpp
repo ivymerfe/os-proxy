@@ -9,6 +9,13 @@
 
 enum class WaitResult { Ready, Timeout, Stopped };
 
+enum class IoStatus { Ok, WouldBlock, Closed };
+
+struct IoResult {
+  IoStatus status;
+  std::size_t bytes;
+};
+
 class Socket {
  public:
   Socket(UniqueFd fd, const StopSignal& stop) noexcept
@@ -25,6 +32,8 @@ class Socket {
                        std::size_t size,
                        std::chrono::milliseconds timeout);
   void writeAll(std::string_view data, std::chrono::milliseconds timeout);
+  IoResult tryRead(char* buffer, std::size_t size);
+  IoResult tryWrite(const char* data, std::size_t size);
   void abort() noexcept;
 
  private:

@@ -79,11 +79,11 @@ std::optional<Config> ConfigParser::parse(int argc, char** argv) {
   static const option options[] = {
       {"port", required_argument, nullptr, 'p'},
       {"max-client-threads", required_argument, nullptr, 't'},
+      {"max-sessions", required_argument, nullptr, OptQueue},
       {"help", no_argument, nullptr, 'h'},
       {"cache-initial-size", required_argument, nullptr, OptInitial},
       {"cache-max-size", required_argument, nullptr, OptMax},
       {"cache-ttl", required_argument, nullptr, OptTtl},
-      {"queue-size", required_argument, nullptr, OptQueue},
       {"log-level", required_argument, nullptr, OptLevel},
       {nullptr, 0, nullptr, 0}};
 
@@ -104,6 +104,10 @@ std::optional<Config> ConfigParser::parse(int argc, char** argv) {
         config.clientThreads = static_cast<std::size_t>(
             parseNumber(optarg, "--max-client-threads", 1, 4096));
         break;
+      case OptQueue:
+        config.maxSessions = static_cast<std::size_t>(
+            parseNumber(optarg, "--max-sessions", 1, 1000000));
+        break;
       case 'h':
         return std::nullopt;
       case OptInitial:
@@ -115,10 +119,6 @@ std::optional<Config> ConfigParser::parse(int argc, char** argv) {
       case OptTtl:
         config.cacheTtl = std::chrono::seconds(
             parseNumber(optarg, "--cache-ttl", 0, 86400ULL * 365));
-        break;
-      case OptQueue:
-        config.queueSize = static_cast<std::size_t>(
-            parseNumber(optarg, "--queue-size", 1, 1000000));
         break;
       case OptLevel:
         config.logLevel = parseLevel(optarg);
@@ -145,19 +145,16 @@ std::optional<Config> ConfigParser::parse(int argc, char** argv) {
 std::string ConfigParser::usage(std::string_view program) {
   std::string text = "Usage: " + std::string(program) + " [options]\n\n";
   text +=
-      "  -p, --port N                порт прокси (по умолчанию 8080)\n"
-      "  -t, --max-client-threads N  размер пула клиентских потоков (по "
-      "умолчанию 4)\n"
-      "  -h, --help                  показать эту справку\n"
+      "  -p, --port N                порт (8080)\n"
+      "  -t, --max-client-threads N  размер пула клиентских потоков (4)\n"
+      "      --max-sessions N        максимум одновременных сессий, сверх "
+      "лимита 503 (1024)\n"
+      "  -h, --help                  очев\n"
       "      --cache-initial-size S  начальный размер кэша, байты или K/M/G "
-      "(по умолчанию 1M)\n"
+      "(1M)\n"
       "      --cache-max-size S      максимальный размер кэша, байты или K/M/G "
-      "(по умолчанию 10M)\n"
-      "      --cache-ttl SEC         время жизни записи кэша в секундах (по "
-      "умолчанию 5)\n"
-      "      --queue-size N          размер очереди ожидающих сессий (по "
-      "умолчанию 128)\n"
-      "      --log-level LEVEL       ERROR|WARN|NOTICE|LOG|DEBUG (по умолчанию "
-      "LOG)\n";
+      "(10M)\n"
+      "      --cache-ttl SEC         время жизни записи кэша в секундах (5)\n"
+      "      --log-level LEVEL       ERROR|WARN|NOTICE|LOG|DEBUG (LOG)\n";
   return text;
 }
