@@ -2,12 +2,13 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "Socket.hpp"
+#include "Net.hpp"
 
 struct Header {
   std::string name;
@@ -59,5 +60,34 @@ class RequestReader {
 
  private:
   Socket& socket_;
+  std::chrono::milliseconds timeout_;
+};
+
+using BodySource = std::function<bool(std::string&)>;
+using HeadHandler = std::function<void(const ResponseHead&)>;
+using DataHandler = std::function<void(const char*, std::size_t)>;
+
+class UpstreamClient {
+ public:
+  UpstreamClient(const StopSignal& stop, std::chrono::milliseconds timeout)
+      : stop_(stop), timeout_(timeout) {}
+
+  void exchange(const HttpRequest& request,
+                const BodySource& body,
+                const HeadHandler& onHead,
+                const DataHandler& onData);
+
+ private:
+  Socket openConnection(const HttpRequest& request);
+  static std::string buildRequestHead(const HttpRequest& request);
+  ResponseHead readHead(Socket& socket, std::string& buffer);
+  void readBody(Socket& socket,
+                const ResponseHead& head,
+                std::string& buffer,
+                const DataHandler& onData);
+  std::size_t receive(Socket& socket, char* buffer, std::size_t size);
+  void transmit(Socket& socket, std::string_view data);
+
+  const StopSignal& stop_;
   std::chrono::milliseconds timeout_;
 };

@@ -1,12 +1,10 @@
-#include "Socket.hpp"
+#include "Net.hpp"
 
 #include <poll.h>
 #include <sys/socket.h>
 
 #include <algorithm>
 #include <cerrno>
-
-#include "Errors.hpp"
 
 WaitResult Socket::wait(short events, std::chrono::milliseconds timeout) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;

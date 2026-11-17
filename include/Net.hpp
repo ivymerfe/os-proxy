@@ -4,8 +4,8 @@
 #include <cstddef>
 #include <string_view>
 
-#include "StopSignal.hpp"
-#include "UniqueFd.hpp"
+#include "Base.hpp"
+#include "Runtime.hpp"
 
 enum class WaitResult { Ready, Timeout, Stopped };
 

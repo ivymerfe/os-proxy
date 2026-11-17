@@ -5,8 +5,8 @@
 
 #include "Config.hpp"
 #include "Logger.hpp"
-#include "Server.hpp"
-#include "StopSignal.hpp"
+#include "Proxy.hpp"
+#include "Runtime.hpp"
 
 int main(int argc, char** argv) {
   try {
