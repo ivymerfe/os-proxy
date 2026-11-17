@@ -6,3 +6,5 @@
 *.o
 /build
 /.cache
+/build-asan
+/build-tsan
